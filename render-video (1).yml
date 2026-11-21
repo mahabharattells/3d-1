@@ -1,0 +1,136 @@
+name: Render Deep Dive 3D Video (20 Jobs x Multi-Chrome)
+
+on:
+  workflow_dispatch:
+    inputs:
+      fps:
+        description: 'Frame rate (24 = cinematic)'
+        required: true
+        default: '24'
+      res:
+        description: '3D resolution scale (1.0 = full 1080x1920, 0.75 = faster)'
+        required: true
+        default: '1.0'
+      aa:
+        description: 'WebGL MSAA samples (4 = crispest edges, 0 = faster)'
+        required: true
+        default: '4'
+      shadow:
+        description: 'Shadow map resolution (2048 = sharpest)'
+        required: true
+        default: '2048'
+      dof:
+        description: 'Enable depth of field bokeh? (true/false)'
+        required: true
+        default: 'true'
+      procs:
+        description: 'Chrome renderers per job (2 for public repo 4-vCPU runners, 1 for private repo 2-vCPU runners)'
+        required: true
+        default: '2'
+
+jobs:
+  render-chunks:
+    name: Render Job ${{ matrix.chunk }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      max-parallel: 20   # free plan = 20 concurrent jobs (Pro 40, Team 60). Raise matrix + JOBS below if you have more.
+      matrix:
+        chunk: [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19]
+    env:
+      JOBS: 20
+    steps:
+      - name: Checkout project
+        uses: actions/checkout@v4
+
+      - name: Unzip project
+        run: unzip -oq microwave-deep-dive-github.zip -x '.github/*'
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Ensure Chrome and FFmpeg are available
+        run: |
+          which ffmpeg || (sudo apt-get update && sudo apt-get install -y ffmpeg)
+          if ! which google-chrome && ! which chromium-browser && ! which chromium; then
+            sudo apt-get update && sudo apt-get install -y chromium-browser
+          fi
+          nproc
+
+      - name: Render this job's frame range (parallel Chrome processes)
+        env:
+          FPS: ${{ inputs.fps }}
+          PROCS: ${{ inputs.procs }}
+          CHUNK: ${{ matrix.chunk }}
+        run: |
+          set -e
+          mkdir -p chunks
+          CHROME_BIN=$(which google-chrome || which chromium-browser || which chromium)
+          NO_BOKEH=""
+          if [ "${{ inputs.dof }}" != "true" ]; then NO_BOKEH="&nobokeh=1"; fi
+          TOTAL=$(python3 -c "import json;print(int(json.load(open('data/cues.json'))['duration']*$FPS+1e-6))")
+          N=$(( JOBS * PROCS ))
+          echo "Total frames: $TOTAL | pieces: $N"
+          pids=()
+          for p in $(seq 0 $(( PROCS - 1 ))); do
+            K=$(( CHUNK * PROCS + p ))
+            F0=$(( TOTAL * K / N ))
+            F1=$(( TOTAL * (K + 1) / N ))
+            S=$(python3 -c "print($F0/$FPS)")
+            E=$(python3 -c "print($F1/$FPS)")
+            OUT="chunks/p_$(printf '%03d' $K).mp4"
+            echo "piece $K: frames $F0-$F1 ($S s -> $E s)"
+            CHROME="$CHROME_BIN" HOST=127.0.0.1 SOFTWARE_GL=1 FPS="$FPS" \
+            QS="&res=${{ inputs.res }}&aa=${{ inputs.aa }}&shadow=${{ inputs.shadow }}${NO_BOKEH}" \
+            node tools/capture.mjs video "$OUT" "$S" "$E" &
+            pids+=($!)
+          done
+          for pid in "${pids[@]}"; do wait "$pid"; done
+          ls -lh chunks
+
+      - name: Upload pieces
+        uses: actions/upload-artifact@v4
+        with:
+          name: chunk-${{ matrix.chunk }}
+          path: chunks/p_*.mp4
+          retention-days: 1
+
+  stitch-final:
+    name: Stitch Final MP4
+    needs: render-chunks
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Checkout project (for data/mix.wav)
+        uses: actions/checkout@v4
+
+      - name: Unzip project
+        run: unzip -oq microwave-deep-dive-github.zip -x '.github/*'
+
+      - name: Download all pieces
+        uses: actions/download-artifact@v4
+        with:
+          pattern: chunk-*
+          merge-multiple: true
+          path: chunks
+
+      - name: Join pieces (no re-encode) and add the voiceover mix
+        run: |
+          which ffmpeg || (sudo apt-get update && sudo apt-get install -y ffmpeg)
+          ls chunks | wc -l
+          for f in $(ls chunks/p_*.mp4 | sort); do echo "file '$PWD/$f'"; done > list.txt
+          ffmpeg -y -hide_banner -loglevel error \
+            -f concat -safe 0 -i list.txt -i data/mix.wav \
+            -map 0:v -map 1:a -c:v copy -c:a aac -b:a 192k -shortest -movflags +faststart \
+            microwave-oven-deep-dive-3d.mp4
+          ffprobe -v error -count_frames -select_streams v -show_entries stream=nb_read_frames,width,height,r_frame_rate -show_entries format=duration,size -of default=noprint_wrappers=1 microwave-oven-deep-dive-3d.mp4
+
+      - name: Upload final video
+        uses: actions/upload-artifact@v4
+        with:
+          name: microwave-oven-deep-dive-3d
+          path: microwave-oven-deep-dive-3d.mp4
+          retention-days: 14
